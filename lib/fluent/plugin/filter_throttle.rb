@@ -6,7 +6,8 @@ module Fluent::Plugin
     Fluent::Plugin.register_filter('throttle', self)
 
     desc "Used to group logs. Groups are rate limited independently"
-    config_param :group_key, :array, :default => ['kubernetes.container_name']
+    config_param :group_key, :array, :default => ['kubernetes.labels.app'] # Old
+    config_param :app_name_key, :string, :default => "answr-be-goapp" # New
 
     desc <<~DESC
       This is the period of of time over which group_bucket_limit applies
@@ -35,7 +36,33 @@ module Fluent::Plugin
     DESC
     config_param :group_warning_delay_s, :integer, :default => 10
 
+    Ticker = Struct.new(
+      :group,
+      :done,
+      :seconds
+    )
+
+    ThrottlePane = Struct.new(
+      :timestamp,
+      :counter
+    )
+
+    ThrottleWindow = Struct.new(
+      :current_ts,
+      :size,
+      :total,
+      :result_mutex,
+      :max_index,
+      :table # []throttle_pane
+    )
+
+    # One Group defined for kubernetes.labels.app == "answr-be-goapp" only.
     Group = Struct.new(
+      :max_rate,
+      :window_size,
+      :slide_interval,
+      :hash, # throttle_window
+
       :rate_count,
       :rate_last_reset,
       :aprox_rate,
@@ -43,8 +70,83 @@ module Fluent::Plugin
       :bucket_last_reset,
       :last_warning)
 
+    def window_create(size)
+      # not needed
+    end
+
+    def window_get(tw, ts)
+      index = -1
+      size = tw.size
+      # log.debug("window_get size #{size}")
+      for i in (0...size) do
+        # log.debug("window get index loop #{i}")
+        if tw.table[i].timestamp.to_i == ts.to_i
+          index = i
+          return index
+        end
+        index = i
+      end
+
+      return -1 # not found
+    rescue StandardError => e
+      log.debug("Encountered error #{e}") 
+    end
+
+    def window_add(tw , ts, val)
+      
+      i = -1
+      index = -1
+      size = -1
+      sum = 0
+
+      tw.current_ts = ts
+      size = tw.size
+      index = window_get(tw, ts)
+
+      # log.debug("window_Add index => #{index}")
+
+      # log.debug("ticker index: #{ts}")
+
+      if index == -1
+        if size - 1 == tw.max_index
+          tw.max_index = -1
+        end
+        tw.max_index += 1
+        tw.table[tw.max_index].timestamp = ts
+        tw.table[tw.max_index].counter = val
+      
+      else
+        tw.table[index].counter += val
+      end
+
+      for c in (0...size)
+        sum += tw.table[c].counter
+      end
+      tw.total = sum
+      # log.debug("window_Add total => #{sum}")
+    rescue StandardError => e
+      log.debug("Encountered error #{e}")
+    end
+
+    def time_ticker
+      while @ticker.done != true
+        now = Time.now
+        # log.debug("group hash: #{@group.hash}")
+        window_add(@group.hash, now, 0)
+        @ticker.group.hash.current_ts = now
+
+        # log.debug("ticker loop: #{now}")
+        sleep(@ticker.seconds)
+
+      end
+    rescue StandardError => e
+      log.debug("Encountered error #{e}")
+    end
+
     def configure(conf)
       super
+
+      # log.debug("configuring plugin: filter_throttle")
 
       @group_key_paths = group_key.map { |key| key.split(".") }
 
@@ -68,86 +170,65 @@ module Fluent::Plugin
 
       raise "group_warning_delay_s must be >= 1" \
         unless @group_warning_delay_s >= 1
+
+      # configure the group
+      now = Time.now
+      # log.debug("current time #{now}")
+      @group = Group.new(10, 5, 1, ThrottleWindow.new(0, 5, 0, -1, -1, Array.new(5, ThrottlePane.new(0, 0))), 0, now, 0, 0, now, nil)
+      # log.debug("group: #{@group}")
+      # @group.hash = window_create(@group.window_size) # throttle_window added in Group.new instantiation
+      @ticker = Ticker.new(@group, false, @group.slide_interval)
+      # log.debug("ticker: #{@ticker}")
+      @ticker_thread = Thread.new(self, &:time_ticker)
+      @ticker_thread.abort_on_exception = true
+      # log.debug("configure complete")
+    rescue StandardError => e
+      # log.debug("Encountered error #{e}")
     end
 
     def start
       super
-
+      @totalrec = 0
+      @droppedrec = 0
       @counters = {}
+      # log.debug("counters summary: #{@counters}")
     end
 
     def shutdown
-      log.debug("counters summary: #{@counters}")
+      # log.debug("counters summary: #{@counters}")
       super
     end
 
     def filter(tag, time, record)
+      @totalrec += 1
+
+      log.debug("\nTotalrec => #{@totalrec}\nDroppedrec => #{@droppedrec}\nRate => #{ @group.hash.total.to_f / @group.hash.size}")
       now = Time.now
       rate_limit_exceeded = @group_drop_logs ? nil : record # return nil on rate_limit_exceeded to drop the record
-      group = extract_group(record)
+      apps_label = extract_group(record)
+
       
-      # Ruby hashes are ordered by insertion. 
-      # Deleting and inserting moves the item to the end of the hash (most recently used)
-      counter = @counters[group] = @counters.delete(group) || Group.new(0, now, 0, 0, now, nil)
-
-      counter.rate_count += 1
-      since_last_rate_reset = now - counter.rate_last_reset
-      if since_last_rate_reset >= 1
-        # compute and store rate/s at most every second
-        counter.aprox_rate = (counter.rate_count / since_last_rate_reset).round()
-        counter.rate_count = 0
-        counter.rate_last_reset = now
-      end
-
-      # try to evict the least recently used group
-      lru_group, lru_counter = @counters.first
-      if !lru_group.nil? && now - lru_counter.rate_last_reset > @group_gc_timeout_s
-        @counters.delete(lru_group)
-      end
-
-      if (now.to_i / @group_bucket_period_s) \
-          > (counter.bucket_last_reset.to_i / @group_bucket_period_s)
-        # next time period reached.
-
-        # wait until rate drops back down (if enabled).
-        if counter.bucket_count == -1 and @group_reset_rate_s != -1
-          if counter.aprox_rate < @group_reset_rate_s
-            log_rate_back_down(now, group, counter)
-          else
-            log_rate_limit_exceeded(now, group, counter)
-            return rate_limit_exceeded
-          end
-        end
-
-        # reset counter for the rest of time period.
-        counter.bucket_count = 0
-        counter.bucket_last_reset = now
-      else
-        # if current time period credit is exhausted, drop the record.
-        if counter.bucket_count == -1
-          log_rate_limit_exceeded(now, group, counter)
+      if apps_label == @app_name_key
+        if @group.hash.total / @group.hash.size >= @group.max_rate
+          log.debug("Rate limit exceeded.")
+          @droppedrec += 1
           return rate_limit_exceeded
         end
+
+        # log.debug("\n@group.hash => #{@group.hash}\n@group.hash.current_ts => #{@group.hash.current_ts}")
+        window_add(@group.hash, @group.hash.current_ts, 1)
       end
-
-      counter.bucket_count += 1
-
-      # if we are out of credit, we drop logs for the rest of the time period.
-      if counter.bucket_count > @group_bucket_limit
-        log_rate_limit_exceeded(now, group, counter)
-        counter.bucket_count = -1
-        return rate_limit_exceeded
-      end
-
+      
       record
     end
 
     private
 
     def extract_group(record)
-      @group_key_paths.map do |key_path|
-        record.dig(*key_path) || record.dig(*key_path.map(&:to_sym))
-      end
+      record["kubernetes.labels.app"]
+      # @group_key_paths.map do |key_path|
+      #   record.dig(*key_path) || record.dig(*key_path.map(&:to_sym))
+      # end
     end
 
     def log_rate_limit_exceeded(now, group, counter)
