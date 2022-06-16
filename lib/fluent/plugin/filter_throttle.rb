@@ -5,36 +5,48 @@ module Fluent::Plugin
   class ThrottleFilter < Filter
     Fluent::Plugin.register_filter('throttle', self)
 
-    desc "Used to group logs. Groups are rate limited independently"
-    config_param :group_key, :array, :default => ['kubernetes.labels.app'] # Old
-    config_param :app_name_key, :string, :default => "answr-be-goapp" # New
+    desc "Used to group logs. Groups are rate limited independently."
+    config_param :groups_config, :hash, :default => {
+      "default" => {
+        "max_rate" => 10,
+        "window_size" => 5,
+        "slide_interval" => 1,
+        "drop_logs" => true
+      },
+      "answr-be-goapp" => {
+        "max_rate" => 2,
+        "window_size" => 5,
+        "slide_interval" => 1,
+        "drop_logs" => true
+      }
+    }
 
-    desc <<~DESC
-      This is the period of of time over which group_bucket_limit applies
-    DESC
-    config_param :group_bucket_period_s, :integer, :default => 60
+    # desc <<~DESC
+    #   This is the period of of time over which group_bucket_limit applies
+    # DESC
+    # config_param :group_bucket_period_s, :integer, :default => 60
 
-    desc <<~DESC
-      Maximum number logs allowed per groups over the period of
-      group_bucket_period_s
-    DESC
-    config_param :group_bucket_limit, :integer, :default => 6000
+    # desc <<~DESC
+    #   Maximum number logs allowed per groups over the period of
+    #   group_bucket_period_s
+    # DESC
+    # config_param :group_bucket_limit, :integer, :default => 6000
 
-    desc "Whether to drop logs that exceed the bucket limit or not"
-    config_param :group_drop_logs, :bool, :default => true
+    # desc "Whether to drop logs that exceed the bucket limit or not"
+    # config_param :group_drop_logs, :bool, :default => true
 
-    desc <<~DESC
-      After a group has exceeded its bucket limit, logs are dropped until the
-      rate per second falls below or equal to group_reset_rate_s.
-    DESC
-    config_param :group_reset_rate_s, :integer, :default => nil
+    # desc <<~DESC
+    #   After a group has exceeded its bucket limit, logs are dropped until the
+    #   rate per second falls below or equal to group_reset_rate_s.
+    # DESC
+    # config_param :group_reset_rate_s, :integer, :default => nil
 
-    desc <<~DESC
-      When a group reaches its limit and as long as it is not reset, a warning
-      message with the current log rate of the group is emitted repeatedly.
-      This is the delay between every repetition.
-    DESC
-    config_param :group_warning_delay_s, :integer, :default => 10
+    # desc <<~DESC
+    #   When a group reaches its limit and as long as it is not reset, a warning
+    #   message with the current log rate of the group is emitted repeatedly.
+    #   This is the delay between every repetition.
+    # DESC
+    # config_param :group_warning_delay_s, :integer, :default => 10
 
     Ticker = Struct.new(
       :group,
@@ -63,11 +75,11 @@ module Fluent::Plugin
       :slide_interval,
       :hash, # throttle_window
 
-      :rate_count,
-      :rate_last_reset,
-      :aprox_rate,
-      :bucket_count,
-      :bucket_last_reset,
+      # :rate_count,
+      # :rate_last_reset,
+      # :aprox_rate,
+      # :bucket_count,
+      # :bucket_last_reset,
       :last_warning)
 
     def window_create(size)
@@ -129,14 +141,17 @@ module Fluent::Plugin
     end
 
     def time_ticker
-      while @ticker.done != true
+      key = Thread.current["key"]
+      log.info("Started time_ticker looper on thread => #{key}")
+      while @tickers[key].done != true
         now = Time.now
         # log.debug("group hash: #{@group.hash}")
-        window_add(@group.hash, now, 0)
-        @ticker.group.hash.current_ts = now
+        window_add(@groups[key].hash, now, 0)
+        @tickers[key].group.hash.current_ts = now
+        
 
         # log.debug("ticker loop: #{now}")
-        sleep(@ticker.seconds)
+        sleep(@tickers[key].seconds) # sleep every second
 
       end
     rescue StandardError => e
@@ -148,48 +163,71 @@ module Fluent::Plugin
 
       # log.debug("configuring plugin: filter_throttle")
 
-      @group_key_paths = group_key.map { |key| key.split(".") }
+      # @group_key_paths = group_key.map { |key| key.split(".") }
 
-      raise "group_bucket_period_s must be > 0" \
-        unless @group_bucket_period_s > 0
+      # raise "group_bucket_period_s must be > 0" \
+       # unless @group_bucket_period_s > 0
 
-      @group_gc_timeout_s = 2 * @group_bucket_period_s
+     # @group_gc_timeout_s = 2 * @group_bucket_period_s
 
-      raise "group_bucket_limit must be > 0" \
-        unless @group_bucket_limit > 0
+      #raise "group_bucket_limit must be > 0" \
+      #  unless @group_bucket_limit > 0
 
-      @group_rate_limit = (@group_bucket_limit / @group_bucket_period_s)
+     # @group_rate_limit = (@group_bucket_limit / @group_bucket_period_s)
 
-      @group_reset_rate_s = @group_rate_limit \
-        if @group_reset_rate_s == nil
+     # @group_reset_rate_s = @group_rate_limit \
+        #if @group_reset_rate_s == nil
 
-      raise "group_reset_rate_s must be >= -1" \
-        unless @group_reset_rate_s >= -1
-      raise "group_reset_rate_s must be <= group_bucket_limit / group_bucket_period_s" \
-        unless @group_reset_rate_s <= @group_rate_limit
+     # raise "group_reset_rate_s must be >= -1" \
+      #  unless @group_reset_rate_s >= -1
+      #raise "group_reset_rate_s must be <= group_bucket_limit / group_bucket_period_s" \
+      #  unless @group_reset_rate_s <= @group_rate_limit
 
-      raise "group_warning_delay_s must be >= 1" \
-        unless @group_warning_delay_s >= 1
+     # raise "group_warning_delay_s must be >= 1" \
+     #  unless @group_warning_delay_s >= 1
 
       # configure the group
       now = Time.now
+      @groups = {}
+      @tickers = {}
+      @ticker_threads = {}
+      @slide_intervals = {}
       # log.debug("current time #{now}")
-      @group = Group.new(10, 5, 1, ThrottleWindow.new(0, 5, 0, -1, -1, Array.new(5, ThrottlePane.new(0, 0))), 0, now, 0, 0, now, nil)
-      # log.debug("group: #{@group}")
-      # @group.hash = window_create(@group.window_size) # throttle_window added in Group.new instantiation
-      @ticker = Ticker.new(@group, false, @group.slide_interval)
+
+     # log.debug("Groups config => #{@groups_config}")
+
+      @groups_config.each do |key, value|
+        #log.debug("Groups key,value => #{key} #{value}")
+        @groups[key] = Group.new(value["max_rate"], value["window_size"], value["slide_interval"], ThrottleWindow.new(0, value["window_size"], 0, -1, -1, Array.new(value["window_size"], ThrottlePane.new(0, 0))), nil)
+        @slide_intervals[value["slide_interval"]] = @groups[key]
+
+        @tickers[key] =  Ticker.new(@groups[key], false, @groups[key].slide_interval)
+        @ticker_threads[key] = Thread.new(self, &:time_ticker)
+        @ticker_threads[key]["key"] = key
+        @ticker_threads[key].abort_on_exception = true
+
+        # log.debug("Groups => #{@groups}")
+      
+      end
+
+
+
+     # @group = Group.new(10, 5, 1, ThrottleWindow.new(0, 5, 0, -1, -1, Array.new(5, ThrottlePane.new(0, 0))), 0, now, 0, 0, now, nil)
+      # # log.debug("group: #{@group}")
+      # # @group.hash = window_create(@group.window_size) # throttle_window added in Group.new instantiation
+     # @ticker = Ticker.new(@group, false, @group.slide_interval)
       # log.debug("ticker: #{@ticker}")
-      @ticker_thread = Thread.new(self, &:time_ticker)
-      @ticker_thread.abort_on_exception = true
-      # log.debug("configure complete")
+     # @ticker_thread = Thread.new(self, &:time_ticker)
+     # @ticker_thread.abort_on_exception = true
+     # # log.debug("configure complete")
     rescue StandardError => e
-      # log.debug("Encountered error #{e}")
+      log.debug("Encountered error #{e}")
     end
 
     def start
       super
-      @totalrec = 0
-      @droppedrec = 0
+      @totalrec = {}
+      @droppedrec = {}
       @counters = {}
       # log.debug("counters summary: #{@counters}")
     end
@@ -200,24 +238,47 @@ module Fluent::Plugin
     end
 
     def filter(tag, time, record)
-      @totalrec += 1
 
-      log.debug("\nTotalrec => #{@totalrec}\nDroppedrec => #{@droppedrec}\nRate => #{ @group.hash.total.to_f / @group.hash.size}")
-      now = Time.now
-      rate_limit_exceeded = @group_drop_logs ? nil : record # return nil on rate_limit_exceeded to drop the record
       apps_label = extract_group(record)
+      
+      now = Time.now
 
       
-      if apps_label == @app_name_key
-        if @group.hash.total / @group.hash.size >= @group.max_rate
-          log.debug("Rate limit exceeded.")
-          @droppedrec += 1
+
+      if groups_config.key?(apps_label)
+
+        if @totalrec.key?(apps_label) ==  false
+          @totalrec[apps_label] = 0
+          @droppedrec[apps_label] = 0
+        end
+
+        @totalrec[apps_label] += 1
+
+        log.info("\n[#{apps_label}] Total records => #{@totalrec[apps_label]}\n[#{apps_label}] Dropped records => #{@droppedrec[apps_label]}\n[#{apps_label}] Approx. Rate => #{@groups[apps_label].hash.total.to_f / @groups[apps_label].hash.size}")
+
+        rate_limit_exceeded = @groups_config[apps_label]["drop_logs"] ? nil : record # return nil on rate_limit_exceeded to drop the record
+
+        if @groups[apps_label].hash.total / @groups[apps_label].hash.size >= @groups[apps_label].max_rate
+          log.warn("[#{apps_label}] Rate limit exceeded.")
+          @droppedrec[apps_label] += 1
+
           return rate_limit_exceeded
         end
 
-        # log.debug("\n@group.hash => #{@group.hash}\n@group.hash.current_ts => #{@group.hash.current_ts}")
-        window_add(@group.hash, @group.hash.current_ts, 1)
+        window_add(@groups[apps_label].hash, @groups[apps_label].hash.current_ts, 1)
       end
+
+      
+      # if apps_label == @app_name_key
+      #  if @group.hash.total / @group.hash.size >= @group.max_rate
+      #    log.debug("Rate limit exceeded.")
+      #    @droppedrec += 1
+      #    return rate_limit_exceeded
+      #  end
+
+      #  # log.debug("\n@group.hash => #{@group.hash}\n@group.hash.current_ts => #{@group.hash.current_ts}")
+      #  window_add(@group.hash, @group.hash.current_ts, 1)
+      #end
       
       record
     end
