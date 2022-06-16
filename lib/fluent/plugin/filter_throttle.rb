@@ -80,7 +80,8 @@ module Fluent::Plugin
       # :aprox_rate,
       # :bucket_count,
       # :bucket_last_reset,
-      :last_warning)
+      :last_warning,
+      :key)
 
     def window_create(size)
       # not needed
@@ -141,17 +142,29 @@ module Fluent::Plugin
     end
 
     def time_ticker
-      key = Thread.current["key"]
-      log.info("Started time_ticker looper on thread => #{key}")
-      while @tickers[key].done != true
+      # key = Thread.current["key"]
+      # log.info("Started time_ticker looper on thread => #{key}")
+      while true
         now = Time.now
+
+        @slide_intervals.each do |key, value|
+          if @ticker_counter % key == 0
+            log.debug("Exec for counter #{@ticker_counter}")
+            value.each do |group|
+              log.debug("group.key => #{group.key}, group.hash.total => #{group.hash.total}, group.hash.size => #{group.hash.size}")
+              window_add(group.hash, now, 0)
+              group.hash.current_ts = now
+            end
+          end
+        end
         # log.debug("group hash: #{@group.hash}")
-        window_add(@groups[key].hash, now, 0)
-        @tickers[key].group.hash.current_ts = now
+        # window_add(@groups[key].hash, now, 0)
+        # @tickers[key].group.hash.current_ts = now
         
 
         # log.debug("ticker loop: #{now}")
-        sleep(@tickers[key].seconds) # sleep every second
+        @ticker_counter += 1
+        sleep(1) # sleep every second
 
       end
     rescue StandardError => e
@@ -192,23 +205,31 @@ module Fluent::Plugin
       @tickers = {}
       @ticker_threads = {}
       @slide_intervals = {}
+      @ticker_counter = 1
       # log.debug("current time #{now}")
 
      # log.debug("Groups config => #{@groups_config}")
 
       @groups_config.each do |key, value|
         #log.debug("Groups key,value => #{key} #{value}")
-        @groups[key] = Group.new(value["max_rate"], value["window_size"], value["slide_interval"], ThrottleWindow.new(0, value["window_size"], 0, -1, -1, Array.new(value["window_size"], ThrottlePane.new(0, 0))), nil)
-        @slide_intervals[value["slide_interval"]] = @groups[key]
+        @groups[key] = Group.new(value["max_rate"], value["window_size"], value["slide_interval"], ThrottleWindow.new(0, value["window_size"], 0, -1, -1, Array.new(value["window_size"], ThrottlePane.new(0, 0))), nil, key)
+        if @slide_intervals.key?(value["slide_interval"]) == false
+          @slide_intervals[value["slide_interval"]] = []
+        end
 
-        @tickers[key] =  Ticker.new(@groups[key], false, @groups[key].slide_interval)
-        @ticker_threads[key] = Thread.new(self, &:time_ticker)
-        @ticker_threads[key]["key"] = key
-        @ticker_threads[key].abort_on_exception = true
+        @slide_intervals[value["slide_interval"]].append(@groups[key])
+
+        # @tickers[key] =  Ticker.new(@groups[key], false, @groups[key].slide_interval)
+        # @ticker_threads[key] = Thread.new(self, &:time_ticker)
+        # @ticker_threads[key]["key"] = key
+        # @ticker_threads[key].abort_on_exception = true
 
         # log.debug("Groups => #{@groups}")
       
       end
+
+      ticker_thread = Thread.new(self, &:time_ticker)
+      ticker_thread.abort_on_exception = true
 
 
 
