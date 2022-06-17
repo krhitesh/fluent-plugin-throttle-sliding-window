@@ -12,14 +12,14 @@ module Fluent::Plugin
         "window_size" => 5,
         "slide_interval" => 1,
         "drop_logs" => true
-      },
-      "answr-be-goapp" => {
-        "max_rate" => 2,
-        "window_size" => 5,
-        "slide_interval" => 1,
-        "drop_logs" => true
       }
     }
+
+    desc "Group key"
+    config_param :group_key :string :default => "kubernetes.pod_name"
+
+    desc "Config key"
+    config_param :config_key :string :default => "kubernetes.labels.app"
 
     # desc <<~DESC
     #   This is the period of of time over which group_bucket_limit applies
@@ -81,7 +81,8 @@ module Fluent::Plugin
       # :bucket_count,
       # :bucket_last_reset,
       :last_warning,
-      :key)
+      :key,
+      :last_event_ts)
 
     def window_create(size)
       # not needed
@@ -141,6 +142,25 @@ module Fluent::Plugin
       log.debug("Encountered error #{e}")
     end
 
+    def gc_groups
+      while true
+        now = Time.now
+        delete_keys = []
+        @groups.each do |key,value|
+          if now.to_i - value.last_event_ts.to_i > 60 #seconds
+            delete_keys.append(key)
+            @slide_intervals[value["slide_interval"]].delete(value)
+          end
+        end
+
+        delete_keys.each do |key|
+          @groups.delete(key)
+        end
+
+        sleep(30)
+      end
+    end
+
     def time_ticker
       # key = Thread.current["key"]
       # log.info("Started time_ticker looper on thread => #{key}")
@@ -149,9 +169,9 @@ module Fluent::Plugin
 
         @slide_intervals.each do |key, value|
           if @ticker_counter % key == 0
-            log.debug("Exec for counter #{@ticker_counter}")
+            #log.debug("Exec for counter #{@ticker_counter}")
             value.each do |group|
-              log.debug("group.key => #{group.key}, group.hash.total => #{group.hash.total}, group.hash.size => #{group.hash.size}")
+              #log.debug("group.key => #{group.key}, group.hash.total => #{group.hash.total}, group.hash.size => #{group.hash.size}")
               window_add(group.hash, now, 0)
               group.hash.current_ts = now
             end
@@ -173,6 +193,8 @@ module Fluent::Plugin
 
     def configure(conf)
       super
+
+      #log.debug("Groups config => #{@groups_config}")
 
       # log.debug("configuring plugin: filter_throttle")
 
@@ -200,9 +222,8 @@ module Fluent::Plugin
      #  unless @group_warning_delay_s >= 1
 
       # configure the group
-      now = Time.now
+      # now = Time.now
       @groups = {}
-      @tickers = {}
       @ticker_threads = {}
       @slide_intervals = {}
       @ticker_counter = 1
@@ -210,26 +231,29 @@ module Fluent::Plugin
 
      # log.debug("Groups config => #{@groups_config}")
 
-      @groups_config.each do |key, value|
-        #log.debug("Groups key,value => #{key} #{value}")
-        @groups[key] = Group.new(value["max_rate"], value["window_size"], value["slide_interval"], ThrottleWindow.new(0, value["window_size"], 0, -1, -1, Array.new(value["window_size"], ThrottlePane.new(0, 0))), nil, key)
-        if @slide_intervals.key?(value["slide_interval"]) == false
-          @slide_intervals[value["slide_interval"]] = []
-        end
+#      @groups_config.each do |key, value|
+#        #log.debug("Groups key,value => #{key} #{value}")
+#        @groups[key] = Group.new(value["max_rate"], value["window_size"], value["slide_interval"], ThrottleWindow.new(0, value["window_size"], 0, -1, -1, Array.new(value["window_size"], ThrottlePane.new(0, 0))), nil, key)
+#        if @slide_intervals.key?(value["slide_interval"]) == false
+#          @slide_intervals[value["slide_interval"]] = []
+#        end
 
-        @slide_intervals[value["slide_interval"]].append(@groups[key])
+#        @slide_intervals[value["slide_interval"]].append(@groups[key])
 
-        # @tickers[key] =  Ticker.new(@groups[key], false, @groups[key].slide_interval)
-        # @ticker_threads[key] = Thread.new(self, &:time_ticker)
-        # @ticker_threads[key]["key"] = key
-        # @ticker_threads[key].abort_on_exception = true
+#        # @tickers[key] =  Ticker.new(@groups[key], false, @groups[key].slide_interval)
+#        # @ticker_threads[key] = Thread.new(self, &:time_ticker)
+#        # @ticker_threads[key]["key"] = key
+#        # @ticker_threads[key].abort_on_exception = true
 
-        # log.debug("Groups => #{@groups}")
+#        # log.debug("Groups => #{@groups}")
       
-      end
+#      end
 
       ticker_thread = Thread.new(self, &:time_ticker)
       ticker_thread.abort_on_exception = true
+
+      cleanup_thread = Thread.new(self, &:cleanup_groups)
+      cleanup_thread.abort_on_exception = true
 
 
 
@@ -260,33 +284,73 @@ module Fluent::Plugin
 
     def filter(tag, time, record)
 
-      apps_label = extract_group(record)
+      apps_label = extract_group(record, "kubernetes.labels.app")
+      pod_name = extract_group(record, "kubernetes.pod_name") # check pod name keys
       
       now = Time.now
 
-      
+      # log.debug("Hash 3 Label =>  #{apps_label}, POD => #{pod_name}")
+      # log.debug("Hash 4 totalrec => #{@totalrec.key?(pod_name)}")
 
       if groups_config.key?(apps_label)
 
-        if @totalrec.key?(apps_label) ==  false
-          @totalrec[apps_label] = 0
-          @droppedrec[apps_label] = 0
+        if @totalrec.key?(pod_name) ==  false
+          @totalrec[pod_name] = 0
+          @droppedrec[pod_name] = 0
+
+          # Init for pod_name
+          value = groups_config[apps_label]
+
+          #log.debug("Hash 5 =>  #{pod_name}")
+
+          @groups[pod_name] = Group.new(
+            value["max_rate"], 
+            value["window_size"], 
+            value["slide_interval"], 
+            ThrottleWindow.new(
+              0, 
+              value["window_size"], 
+              0, 
+              -1,
+              -1, 
+              Array.new(
+                value["window_size"],
+                 ThrottlePane.new(0, 0)
+                )
+            ), 
+            nil, 
+            pod_name,
+            now
+          )
+
+          #log.debug("Hash 2 => #{@groups[pod_name]}")
+
+          if @slide_intervals.key?(value["slide_interval"]) == false
+            @slide_intervals[value["slide_interval"]] = []
+          end
+
+          @slide_intervals[value["slide_interval"]].append(@groups[pod_name])
+
         end
 
-        @totalrec[apps_label] += 1
+        @totalrec[pod_name] += 1
 
-        log.info("\n[#{apps_label}] Total records => #{@totalrec[apps_label]}\n[#{apps_label}] Dropped records => #{@droppedrec[apps_label]}\n[#{apps_label}] Approx. Rate => #{@groups[apps_label].hash.total.to_f / @groups[apps_label].hash.size}")
+        #log.debug("Hash 1 => #{@groups[pod_name]}")
 
+        log.info("Pod name => #{pod_name}, Total records => #{@totalrec[pod_name]}, Dropped records => #{@droppedrec[pod_name]}, Approx Rate => #{@groups[pod_name].hash.total.to_f / @groups[pod_name].hash.size}")
+
+        # log.debug("Pod name => #{pod_name}")
         rate_limit_exceeded = @groups_config[apps_label]["drop_logs"] ? nil : record # return nil on rate_limit_exceeded to drop the record
 
-        if @groups[apps_label].hash.total / @groups[apps_label].hash.size >= @groups[apps_label].max_rate
-          log.warn("[#{apps_label}] Rate limit exceeded.")
-          @droppedrec[apps_label] += 1
+        if @groups[pod_name].hash.total / @groups[pod_name].hash.size >= @groups[pod_name].max_rate
+          log.warn("[#{pod_name}] Rate limit exceeded.")
+          @droppedrec[pod_name] += 1
 
           return rate_limit_exceeded
         end
 
-        window_add(@groups[apps_label].hash, @groups[apps_label].hash.current_ts, 1)
+        @groups[pod_name].last_event_ts = now
+        window_add(@groups[pod_name].hash, @groups[pod_name].hash.current_ts, 1)
       end
 
       
@@ -306,8 +370,8 @@ module Fluent::Plugin
 
     private
 
-    def extract_group(record)
-      record["kubernetes.labels.app"]
+    def extract_group(record, key)
+      record[key]
       # @group_key_paths.map do |key_path|
       #   record.dig(*key_path) || record.dig(*key_path.map(&:to_sym))
       # end
