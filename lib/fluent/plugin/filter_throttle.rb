@@ -138,6 +138,7 @@ module Fluent::Plugin
         @slide_intervals.each do |key, value|
           if @ticker_counter % key == 0
             value.each do |group|
+              log.info("#{group.key} at #{now}: limit is #{group.max_rate} per #{group.slide_interval}s with window size of #{group.window_size}, current rate is #{group.hash.total.to_f / group.hash.size} per interval")
               window_add(group.hash, now, 0)
               group.hash.current_ts = now
             end
@@ -160,7 +161,7 @@ module Fluent::Plugin
       @counters = {}
       ticker_thread = Thread.new(self, &:time_ticker)
       ticker_thread.abort_on_exception = true
-      cleanup_thread = Thread.new(self, &:cleanup_groups)
+      cleanup_thread = Thread.new(self, &:gc_groups)
       cleanup_thread.abort_on_exception = true
     end
 
@@ -197,12 +198,10 @@ module Fluent::Plugin
 
         @totalrec[pod_name] += 1
 
-        log.info("Pod name => #{pod_name}, Total records => #{@totalrec[pod_name]}, Dropped records => #{@droppedrec[pod_name]}, Approx Rate => #{@groups[pod_name].hash.total.to_f / @groups[pod_name].hash.size}")
-
         rate_limit_exceeded = @groups_config[apps_label]["drop_logs"] ? nil : record
 
         if @groups[pod_name].hash.total / @groups[pod_name].hash.size >= @groups[pod_name].max_rate
-          log.warn("Pod name => #{pod_name}, message => Rate limit exceeded.")
+          log.warn("#{pod_name} at #{now}: Rate limit exceeded.")
           @droppedrec[pod_name] += 1
           return rate_limit_exceeded
         end
@@ -217,9 +216,6 @@ module Fluent::Plugin
 
     def extract_group(record, key)
       record[key]
-      # @group_key_paths.map do |key_path|
-      #   record.dig(*key_path) || record.dig(*key_path.map(&:to_sym))
-      # end
     end
   end
 end
